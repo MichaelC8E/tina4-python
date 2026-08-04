@@ -148,7 +148,19 @@ class TestFileRoutes:
 
 # ── S3Storage against a real MinIO (skipped if unreachable) ─────────
 
-def _minio_reachable(host="localhost", port=9100) -> bool:
+# MinIO's coordinates stay literal on purpose, unlike the Firebird ones that
+# tests/test_firebird_url.py had to make env-resolvable. That fix was needed
+# because its literals named port 53050, which NOTHING publishes, so its gate
+# could never open. 9100 is the port the lab container and the CI service
+# container both actually publish, so the literal is correct rather than dead.
+# Introducing a TINA4_TEST_S3_* name would also mean editing
+# tests/fixtures/test_env_contract.json, which is shared byte-for-byte with the
+# other three frameworks -- a cross-framework change, not a Python one.
+_MINIO_HOST = "localhost"
+_MINIO_PORT = 9100
+
+
+def _minio_reachable(host=_MINIO_HOST, port=_MINIO_PORT) -> bool:
     try:
         with socket.create_connection((host, port), timeout=0.5):
             return True
@@ -164,13 +176,30 @@ def _boto3_available() -> bool:
         return False
 
 
-@pytest.mark.skipif(
-    not (_minio_reachable() and _boto3_available()),
-    reason="needs a real MinIO on localhost:9100 and boto3 (real S3, never mocked)")
+def _s3_skip_reason() -> str:
+    """Why the live S3 tests cannot run here, or "" when they can.
+
+    The reason NAMES WHICH HALF of the gate failed, in wording the
+    TINA4_REQUIRE_SERVICES gate in tests/conftest.py recognises ("minio ...
+    not reachable" / "boto3 not installed"). The old single reason said
+    "needs a real MinIO on localhost:9100 and boto3" -- it matched neither a
+    service keyword the gate knew nor an unavailability hint, so on a fully
+    provisioned host these two tests skipped GREEN and nothing complained.
+    They had never executed once. Attributing the halves separately is what
+    turned "something about S3 is off" into "boto3 is not in the venv".
+    """
+    if not _boto3_available():
+        return "boto3 not installed (it is in the `test` extra: uv sync --extra test)"
+    if not _minio_reachable():
+        return f"minio not reachable at {_MINIO_HOST}:{_MINIO_PORT} (real S3, never mocked)"
+    return ""
+
+
+@pytest.mark.skipif(bool(_s3_skip_reason()), reason=_s3_skip_reason() or "live S3 available")
 class TestS3Storage:
     def _store(self, monkeypatch):
         monkeypatch.setenv("TINA4_STORAGE_BACKEND", "s3")
-        monkeypatch.setenv("TINA4_STORAGE_URL", "http://localhost:9100")
+        monkeypatch.setenv("TINA4_STORAGE_URL", f"http://{_MINIO_HOST}:{_MINIO_PORT}")
         monkeypatch.setenv("TINA4_STORAGE_KEY", "minioadmin")
         monkeypatch.setenv("TINA4_STORAGE_SECRET", "minioadmin")
         monkeypatch.setenv("TINA4_STORAGE_BUCKET", "tina4-rt-test")

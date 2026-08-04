@@ -25,6 +25,12 @@ odbc = ["pyodbc>=5.0"]
 redis = ["redis>=5.0"]
 memcache = ["pymemcache>=4.0"]
 
+# Realtime file storage — the S3Storage backend is opt-in and needs boto3.
+# tina4_python/realtime/storage.py imports it lazily inside S3Storage.__init__
+# precisely so core stays zero-dependency; this extra is how an app that sets
+# TINA4_STORAGE_BACKEND=s3 asks for the driver.
+s3 = ["boto3>=1.34"]
+
 # Queue backends — install what you need
 kafka = ["confluent-kafka>=2.0"]
 rabbitmq = ["pika>=1.3"]
@@ -53,6 +59,14 @@ all-db = [
 # Includes firebird-driver even though the Firebird CI job installs it on its
 # own: `uv sync --extra X` PRUNES anything outside the named extras, so a test
 # extra that omitted it would silently uninstall it on a host that had it.
+#
+# boto3 is here for exactly that reason, one dependency later. The two
+# S3Storage tests in tests/test_realtime_files.py gate on `import boto3`, boto3
+# was declared in NO extra, and every `uv sync --extra test` therefore pruned it
+# back out of the project venv even on a host where someone had installed it by
+# hand. MinIO was up and reachable the whole time; the tests had simply never
+# executed once. Same trap as firebird-driver above, and as the broker /
+# MySQL / Postgres-port variables before that.
 test = [
     "psycopg2-binary>=2.9",
     "mysql-connector-python>=9.0",
@@ -64,6 +78,7 @@ test = [
     "pymemcache>=4.0",
     "confluent-kafka>=2.0",
     "pika>=1.3",
+    "boto3>=1.34",
 ]
 
 [dependency-groups]

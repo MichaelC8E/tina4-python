@@ -75,6 +75,7 @@ import json
 import os
 import socket
 import stat
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -120,17 +121,20 @@ class _RealLogSink:
     """
 
     def __init__(self, directory: Path):
-        self._path = directory / "tina4.log"
+        # Public: the privilege-dropping test below has to widen the permissions
+        # on both of these before its unprivileged child can append a record.
+        self.directory = directory
+        self.path = directory / "tina4.log"
         self._mark = 0
 
     def mark(self) -> None:
         """Ignore everything logged before the scenario under test."""
-        self._mark = self._path.stat().st_size if self._path.exists() else 0
+        self._mark = self.path.stat().st_size if self.path.exists() else 0
 
     def lines(self) -> list[str]:
-        if not self._path.exists():
+        if not self.path.exists():
             return []
-        with self._path.open("r", encoding="utf-8", errors="replace") as handle:
+        with self.path.open("r", encoding="utf-8", errors="replace") as handle:
             handle.seek(self._mark)
             return [line for line in handle.read().splitlines() if line.strip()]
 
@@ -264,15 +268,40 @@ def test_gc_failure_logs_and_does_not_crash(log_sink, unreachable_mongo):
     assert any("gc" in e and "failed" in e for e in log_sink.errors())
 
 
-def test_write_fails_after_a_successful_start_with_a_real_eacces(log_sink, tmp_path):
-    """The mid-request death case, produced rather than simulated.
+def _unprivileged_account():
+    """A real non-root ``(name, uid, gid)`` on this host, or None."""
+    import pwd
 
-    A REAL FileSessionHandler writes successfully, then the real session FILE is
-    made read-only so the NEXT write takes a real EACCES from the real kernel.
+    for name in ("nobody", "daemon", "games"):
+        try:
+            entry = pwd.getpwnam(name)
+        except KeyError:
+            continue
+        if entry.pw_uid != 0:
+            return name, entry.pw_uid, entry.pw_gid
+    return None
+
+
+def _grant_other_traversal(leaf: Path) -> None:
+    """Add o+rx to every directory from ``leaf`` up to the temp root.
+
+    pytest creates /tmp/pytest-of-root/... without world execute, so a
+    privilege-dropped child cannot even RESOLVE the path to the session file:
+    it would take an EACCES during path traversal instead of on the write under
+    test. Both are errno 13, so the test would pass while measuring the wrong
+    syscall -- which is why the child also asserts its own uid, and why only the
+    session FILE (not the directories) is left unwritable.
     """
-    if os.geteuid() == 0:
-        pytest.skip("running as root: chmod 0400 does not deny root, so no real EACCES")
+    stop = Path(tempfile.gettempdir()).resolve()
+    current = leaf.resolve()
+    while current != stop and current.parent != current:
+        current.chmod(stat.S_IMODE(current.stat().st_mode) | stat.S_IROTH | stat.S_IXOTH)
+        current = current.parent
 
+
+def _assert_second_write_takes_a_real_eacces(log_sink, tmp_path):
+    """The assertion under test, run verbatim as root's forked child and inline
+    as a non-root user. Raises AssertionError; never skips."""
     handler = FileSessionHandler(path=str(tmp_path / "sessions"))
     session = Session(handler=handler)
     sid = session.start("sess-eacces")
@@ -296,6 +325,102 @@ def test_write_fails_after_a_successful_start_with_a_real_eacces(log_sink, tmp_p
     ), f"the logged cause must be the real EACCES. Got: {errors}"
 
     session_file.chmod(stat.S_IRUSR | stat.S_IWUSR)  # so tmp_path can be cleaned
+
+
+def test_write_fails_after_a_successful_start_with_a_real_eacces(log_sink, tmp_path):
+    """The mid-request death case, produced rather than simulated.
+
+    A REAL FileSessionHandler writes successfully, then the real session FILE is
+    made read-only so the NEXT write takes a real EACCES from the real kernel.
+
+    RUNNING AS ROOT. chmod 0400 denies root nothing, so as root this assertion
+    is not merely untestable, it is INVERTED: ``save()`` would succeed and every
+    assertion below would be measuring the opposite of the contract. It used to
+    ``pytest.skip`` for that reason, which meant the lab -- which runs the whole
+    suite as root -- never executed this test at all, and neither did anything
+    else running in a container as root. The skip was correct about the physics
+    and wrong about the remedy.
+
+    The remedy is to stop being root: fork, drop to a real unprivileged account
+    in the child with setgid/setuid, and run the SAME assertion body there,
+    where 0400 does deny the write and the kernel does raise a real EACCES. The
+    parent waits for the child and adopts its verdict. A non-root host is
+    already in that state, so it runs the body inline exactly as before. No
+    special lab user, no change to how the suite is invoked, and no skip on any
+    host.
+    """
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        # Already unprivileged: 0400 genuinely denies this user.
+        _assert_second_write_takes_a_real_eacces(log_sink, tmp_path)
+        return
+
+    account = _unprivileged_account()
+    if account is None:
+        pytest.fail(
+            "running as root, and this host has no unprivileged account to drop "
+            "to (tried nobody, daemon, games), so a real EACCES cannot be "
+            "produced. Create one rather than letting this test go quiet."
+        )
+    name, uid, gid = account
+
+    # The child must be able to reach and write the temp tree. Only the session
+    # file is made unwritable, and only after its first write has succeeded.
+    _grant_other_traversal(tmp_path)
+    tmp_path.chmod(0o777)
+    log_sink.directory.chmod(0o777)
+    if log_sink.path.exists():
+        log_sink.path.chmod(0o666)
+
+    report_read, report_write = os.pipe()
+    child_pid = os.fork()
+    if child_pid == 0:  # pragma: no cover - runs in the forked child
+        exit_code = 1
+        try:
+            os.close(report_read)
+            os.setgroups([])
+            os.setgid(gid)
+            os.setuid(uid)
+            # ASSERT THE INSTRUMENT BEFORE THE SUBJECT. A setuid that silently
+            # failed would leave the child running as root, where 0400 denies
+            # nothing -- and then every assertion below would pass for exactly
+            # the wrong reason. A green that means the opposite of what it
+            # claims is worse than the skip this replaced, so the child proves
+            # it dropped privileges and the parent refuses a pass without it.
+            if os.getuid() == 0 or os.geteuid() == 0:
+                os.write(report_write, b"child is STILL uid 0 after setuid: "
+                                       b"privileges were not dropped")
+                os._exit(3)
+            os.write(report_write,
+                     f"dropped to {name} uid={os.getuid()} euid={os.geteuid()}\n".encode())
+            _assert_second_write_takes_a_real_eacces(log_sink, tmp_path)
+            exit_code = 0
+        except BaseException as exc:  # reported to the parent, never swallowed
+            try:
+                os.write(report_write, f"{type(exc).__name__}: {exc}".encode()[:8192])
+            except OSError:
+                pass
+        finally:
+            os._exit(exit_code)
+
+    os.close(report_write)
+    chunks = []
+    while True:
+        chunk = os.read(report_read, 65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    os.close(report_read)
+    report = b"".join(chunks).decode("utf-8", "replace").strip()
+    _, wait_status = os.waitpid(child_pid, 0)
+
+    assert os.WIFEXITED(wait_status), f"the child died on a signal. It said: {report}"
+    assert f"dropped to {name}" in report, (
+        "the child never confirmed it dropped privileges, so its verdict proves "
+        f"nothing about EACCES. It said: {report}"
+    )
+    assert os.WEXITSTATUS(wait_status) == 0, (
+        f"the privilege-dropped child failed the EACCES assertion. It said: {report}"
+    )
 
 
 # ── the empty-but-healthy case, read off a real server ──────────────────────

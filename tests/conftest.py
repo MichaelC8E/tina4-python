@@ -5,11 +5,12 @@ import os
 import pytest
 
 # Provisioned real services (and their client libraries). CI stands all of these
-# up, so an integration test should never skip in CI. Firebird is deliberately
-# NOT in this list -- it is not provisioned, so its skips stay green. MySQL and
-# MSSQL joined the provisioned set in 3.13.44 (#262), so their reachability /
-# driver skips now fail the gate too.
-_SERVICE_KEYWORDS = (
+# up, so an integration test should never skip in CI. MySQL and MSSQL joined the
+# provisioned set in 3.13.44 (#262), so their reachability / driver skips now
+# fail the gate too.
+#
+# Firebird is NO LONGER unconditionally excluded -- see _CONDITIONAL_SERVICES.
+_ALWAYS_PROVISIONED = (
     "postgres", "postgresql", "psycopg2",
     "mysql",            # also matches "mysql-connector-python"
     "mssql", "sqlserver", "pymssql",
@@ -26,7 +27,43 @@ _SERVICE_KEYWORDS = (
     # mail keyword existed in this tuple, so every one of those live tests could
     # skip green in CI forever behind a comment saying it could not.
     "greenmail", "smtp", "imap",
+    # MinIO (real S3 API) for the realtime-files S3Storage round trip, plus its
+    # client library. boto3 lives in the `test` extra, so a "boto3 not installed"
+    # skip means the extra was not synced, not that S3 is unprovisioned.
+    "minio", "boto3",
 )
+
+# Services provisioned on SOME runners and genuinely absent on others. The
+# environment variable IS the provisioning signal: it is what stands the tests
+# up, so it is also what decides whether their skip is tolerable.
+#
+# FIREBIRD. This gate used to carry a flat "Firebird is not provisioned" claim,
+# which was FALSE and was the single reason Firebird skips survived every
+# previous no-skip pass. Firebird is provisioned on the lab host
+# (tina4-lab-firebird, engine 5.0.4 on 3050) and in the dedicated `firebird` CI
+# job, both of which export TINA4_TEST_FIREBIRD_URL; it is genuinely absent from
+# the main `test` CI job, which deliberately does not stand up a fifth database
+# on an already-heavy multi-service runner.
+#
+# A static exclusion cannot tell those apart, so it lied on two runners out of
+# three. Keying off the variable is honest on all of them AND self-correcting:
+# the day the main CI job provisions Firebird, its skips start failing the gate
+# with no edit here.
+_CONDITIONAL_SERVICES = (
+    ("firebird", "TINA4_TEST_FIREBIRD_URL"),
+)
+
+
+def _service_keywords():
+    """Keywords naming a service that IS provisioned in this environment."""
+    keywords = list(_ALWAYS_PROVISIONED)
+    keywords.extend(
+        keyword for keyword, env_var in _CONDITIONAL_SERVICES
+        if str(os.environ.get(env_var, "")).strip()
+    )
+    return tuple(keywords)
+
+
 # A keyword must match the text the test ACTUALLY skips with, and tests skip on
 # the CLIENT LIBRARY name as often as the service name. Where the two differ and
 # the service name is not a substring of the client's, BOTH belong above:
@@ -36,9 +73,13 @@ _SERVICE_KEYWORDS = (
 # "confluent-kafka" and "psycopg2"/"pymssql" are listed explicitly, so those were
 # already covered -- the gap was only where neither held.)
 #
-# pyodbc is deliberately NOT here. There is no ODBC service in the lab or in CI,
-# so -- exactly like Firebird -- an ODBC skip is a genuinely-unprovisioned skip
-# and must stay green. Add it the day an ODBC service is provisioned.
+# pyodbc is deliberately NOT here, and it stands on its OWN evidence rather than
+# on the (now-retired) analogy to Firebird: the SYSTEM unixODBC runtime is absent
+# on both the lab host and the CI runners -- `odbcinst` is not installed and
+# libodbc.so.2 is not in the loader path -- so `import pyodbc` raises ImportError
+# even though the wheel itself is present. That is a genuinely-unprovisioned
+# dependency, so an ODBC skip stays green. Add it the day a runner installs
+# unixodbc and stands up a DSN.
 _UNAVAILABLE_HINTS = (
     "not reachable", "unreachable", "not running", "not set",
     "not installed", "could not connect", "not available", "refused",
@@ -55,7 +96,8 @@ def _require_services():
 
 def _is_provisioned_service_skip(reason):
     low = (reason or "").lower()
-    return any(k in low for k in _SERVICE_KEYWORDS) and any(h in low for h in _UNAVAILABLE_HINTS)
+    return (any(k in low for k in _service_keywords())
+            and any(h in low for h in _UNAVAILABLE_HINTS))
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -64,12 +106,12 @@ def pytest_runtest_makereport(item, call):
     service being unavailable into a hard FAILURE.
 
     CI provisions PostgreSQL, MySQL, MSSQL, Redis, Valkey, Memcached, MongoDB,
-    RabbitMQ, and Kafka and sets every canonical test-service URL (see
+    RabbitMQ, Kafka and MinIO and sets every canonical test-service URL (see
     tests/fixtures/test_env_contract.json), so these integration
     tests must run. A skip that names one of those services (or its client
     library) means the service or driver silently went missing -- the exact gap
-    that let the migration and queue bugs ship green. Firebird is not
-    provisioned, so its skips never match these keywords and stay green.
+    that let the migration and queue bugs ship green. Firebird counts wherever
+    TINA4_TEST_FIREBIRD_URL is exported and nowhere else (_CONDITIONAL_SERVICES).
     """
     outcome = yield
     report = outcome.get_result()

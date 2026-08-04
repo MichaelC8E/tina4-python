@@ -182,6 +182,29 @@ jobs:
           MQTT_REQUIRE_EMQX=false bash tests/mqtt-infra.sh "$RUNNER_TEMP/tina4-mqtt-infra"
           echo "TINA4_TEST_MQTT_CA_FILE=$RUNNER_TEMP/tina4-mqtt-infra/certs/ca.crt" >> "$GITHUB_ENV"
 
+      # MinIO: a real S3 API for the S3Storage round trip in
+      # tests/test_realtime_files.py. Those two tests had NEVER executed on any
+      # runner -- boto3 was declared in no extra AND no S3 service existed here
+      # -- so the shipped S3 storage backend had zero live coverage while
+      # reporting green. A `services:` block cannot start MinIO: service
+      # containers accept no command, and the image needs `server /data`. So it
+      # runs as a plain container, like the Firebird job does, and the job FAILS
+      # if it never answers -- an unreachable MinIO must be loud, not a skip.
+      - name: Start MinIO (real S3 on 9100)
+        run: |
+          docker run -d --name tina4-minio -p 9100:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
+          echo "Waiting for MinIO to answer on :9100 ..."
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9100/minio/health/live >/dev/null 2>&1; then
+              echo "MinIO ready after ${i} attempt(s)"; exit 0
+            fi
+            sleep 2
+          done
+          echo "MinIO did not become ready in time"; docker logs tina4-minio | tail -40; exit 1
+
       - name: Install dependencies
         # `--extra test` is the DECLARED client set (pyproject
         # [project.optional-dependencies].test). It replaces an ad-hoc

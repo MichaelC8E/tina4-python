@@ -315,24 +315,38 @@ class TestSQLiteConnectionPath:
         resolved = self._resolve("sqlite:///./data/app.db")
         assert os.path.dirname(resolved).endswith("data")
 
-    def test_absolute_unix(self, tmp_path):
-        # On POSIX, /tmp/.../absolute.db → sqlite:////tmp/.../absolute.db
-        # On Windows the four-slash form encodes a UNIX-shape path (which
-        # cannot exist as a Windows drive); skip there. Windows absolute
-        # paths use the test_absolute_windows_drive_letter form instead.
-        import sys
-        if sys.platform.startswith("win"):
-            pytest.skip("four-slash absolute form is POSIX-shaped; Windows uses drive-letter form")
-        abs_path = str(tmp_path / "absolute.db")
-        # Build the four-slash form
-        url = f"sqlite:////{abs_path.lstrip('/')}"
-        assert self._resolve(url) == abs_path
+    def test_absolute_unix(self):
+        # POSIX-SHAPED INPUT, not a host path. This used to build its URL out of
+        # tmp_path and therefore had to skip on Windows, where tmp_path is
+        # "C:\Users\..." and the four-slash form cannot encode it. But
+        # Database._connection_path (tina4_python/database/connection.py:343) is
+        # a PURE STRING FUNCTION with no branch on sys.platform -- is_windows_abs
+        # is decided entirely by the shape of the input. So the parser can be
+        # driven with a POSIX-shaped literal on any host, and the case is now
+        # covered on every platform instead of only on POSIX ones.
+        assert self._resolve("sqlite:////var/lib/tina4/absolute.db") == "/var/lib/tina4/absolute.db"
 
     def test_absolute_windows_drive_letter(self, tmp_path, monkeypatch):
         # urlparse("sqlite:///C:/Users/app.db").path == "/C:/Users/app.db"
         # Strip one "/" → "C:/Users/app.db" which is_windows_abs=True.
         monkeypatch.chdir(tmp_path)
         assert self._resolve("sqlite:///C:/Users/app.db") == "C:/Users/app.db"
+
+    def test_absolute_windows_drive_letter_backslash(self, tmp_path, monkeypatch):
+        # The OTHER half of the is_windows_abs branch -- stripped[2] accepts "/"
+        # OR "\\", and only the forward-slash spelling had a test, so the
+        # backslash form (the one Windows itself writes) was never exercised on
+        # any platform. Windows-shaped INPUT needs no Windows host.
+        monkeypatch.chdir(tmp_path)
+        assert self._resolve(r"sqlite:///C:\Users\app.db") == r"C:\Users\app.db"
+
+    def test_a_bare_drive_letter_is_not_mistaken_for_an_absolute_path(self, tmp_path, monkeypatch):
+        # NEGATIVE CONTROL for the two above. is_windows_abs needs a separator
+        # after the colon, so "C:app.db" is a RELATIVE path and must resolve
+        # under cwd. Without this, a parser that treated any "X:" prefix as
+        # absolute would still pass every drive-letter test here.
+        monkeypatch.chdir(tmp_path)
+        assert self._resolve("sqlite:///C:app.db") == os.path.join(str(tmp_path), "C:app.db")
 
     def test_in_memory_short_form(self):
         assert self._resolve("sqlite::memory:") == ":memory:"
