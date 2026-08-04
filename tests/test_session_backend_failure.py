@@ -346,12 +346,13 @@ def test_write_fails_after_a_successful_start_with_a_real_eacces(log_sink, tmp_p
     made read-only so the NEXT write takes a real EACCES from the real kernel.
 
     RUNNING AS ROOT. chmod 0400 denies root nothing, so as root this assertion
-    is not merely untestable, it is INVERTED: ``save()`` would succeed and every
-    assertion below would be measuring the opposite of the contract. It used to
-    ``pytest.skip`` for that reason, which meant the lab -- which runs the whole
-    suite as root -- never executed this test at all, and neither did anything
-    else running in a container as root. The skip was correct about the physics
-    and wrong about the remedy.
+    is not merely untestable, it is INVERTED. Measured on the lab (uid 0, file
+    mode 0400): the second ``save()`` returns **True**, where this test asserts
+    False -- so the old ``pytest.skip`` was not hiding an unrunnable test, it
+    was hiding a FAILING one. That skip meant the lab, which runs the whole
+    suite as root, never executed this at all, and neither did any CI container
+    running as root. It was correct about the physics and wrong about the
+    remedy.
 
     The remedy is to stop being root: fork, drop to a real unprivileged account
     in the child with setgid/setuid, and run the SAME assertion body there,
