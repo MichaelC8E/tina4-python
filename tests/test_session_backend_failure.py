@@ -285,18 +285,30 @@ def _unprivileged_account():
 def _grant_other_traversal(leaf: Path) -> None:
     """Add o+rx to every directory from ``leaf`` up to the temp root.
 
-    pytest creates /tmp/pytest-of-root/... without world execute, so a
-    privilege-dropped child cannot even RESOLVE the path to the session file:
-    it would take an EACCES during path traversal instead of on the write under
-    test. Both are errno 13, so the test would pass while measuring the wrong
-    syscall -- which is why the child also asserts its own uid, and why only the
-    session FILE (not the directories) is left unwritable.
+    Measured, not assumed: pytest creates /tmp/pytest-of-root AND its
+    pytest-<n> child with mode 0700, so a privilege-dropped child cannot even
+    RESOLVE the path to the session file. It would take an EACCES during path
+    traversal instead of on the write under test. Both are errno 13, so the
+    test would pass while measuring the wrong syscall -- which is why the child
+    also asserts its own uid, and why only the session FILE (never a directory)
+    is left unwritable.
+
+    The walk stops at the temp root. If ``leaf`` is not under it (someone passed
+    --basetemp), only ``leaf`` itself is widened: chmod-ing every directory up
+    to / would quietly loosen $HOME on whatever host ran the suite, and a child
+    that then cannot traverse fails loudly with its own report, which is the
+    correct outcome.
     """
     stop = Path(tempfile.gettempdir()).resolve()
     current = leaf.resolve()
+    chain = []
     while current != stop and current.parent != current:
-        current.chmod(stat.S_IMODE(current.stat().st_mode) | stat.S_IROTH | stat.S_IXOTH)
+        chain.append(current)
         current = current.parent
+    if current != stop:
+        chain = [leaf.resolve()]
+    for directory in chain:
+        directory.chmod(stat.S_IMODE(directory.stat().st_mode) | stat.S_IROTH | stat.S_IXOTH)
 
 
 def _assert_second_write_takes_a_real_eacces(log_sink, tmp_path):
