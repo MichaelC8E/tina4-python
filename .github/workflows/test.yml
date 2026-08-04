@@ -195,7 +195,7 @@ jobs:
           docker run -d --name tina4-minio -p 9100:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
+            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
           echo "Waiting for MinIO to answer on :9100 ..."
           for i in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:9100/minio/health/live >/dev/null 2>&1; then
