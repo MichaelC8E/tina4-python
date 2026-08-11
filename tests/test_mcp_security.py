@@ -146,3 +146,101 @@ class TestDatabaseQueryReadOnly:
         self._bind_memory_db()
         out = self._query_tool()("SELECT 1; DROP TABLE users")
         assert "error" in out and "multiple statements" in out["error"].lower()
+
+
+class _CaptureResponse:
+    """Captures what a handler passes to response(body, status)."""
+
+    def __init__(self):
+        self.body = None
+        self.status = None
+
+    def __call__(self, body, status=200):
+        self.body = body
+        self.status = status
+        return self
+
+
+class _CallReq:
+    """The exact shape _api_mcp_call reads: the RAW socket peer (remote_ip),
+    the headers (for the token), and the parsed JSON body."""
+
+    def __init__(self, body, remote_ip="", headers=None):
+        self.remote_ip = remote_ip
+        self.headers = headers or {}
+        self.body = body
+
+
+class TestMcpCallShimGate:
+    """The tool-INVOCATION shim POST /__dev/api/mcp/call MUST enforce the same
+    two-layer gate every other MCP surface enforces. A remote unauthenticated
+    caller must not be able to run a privileged tool (database_execute).
+
+    Regression for the audit finding that _api_mcp_call was fail-open while its
+    siblings (_api_mcp_tools/_api_mcp_endpoint/_api_mcp_message/_api_mcp_sse) all
+    call _mcp_request_allowed and 404 a disallowed caller. The witness is real:
+    the write either lands in a real SQLite row or it does not.
+    """
+
+    def _bind_probe_db(self, tmp_path):
+        from tina4_python.orm import bind_database
+        from tina4_python.database import Database
+        db = Database(f"sqlite:///{tmp_path}/mcp_gate_probe.db")
+        bind_database(db)
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS gate_probe "
+            "(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+        db.commit()
+        return db
+
+    def _row_count(self):
+        out = _get_default_server()._tools["database_query"]["handler"](
+            "SELECT count(*) as n FROM gate_probe")
+        return out["records"][0]["n"]
+
+    async def _call(self, req):
+        from tina4_python.dev_admin import _api_mcp_call
+        resp = _CaptureResponse()
+        await _api_mcp_call(req, resp)
+        return resp
+
+    async def test_remote_no_token_is_404_and_tool_does_not_run(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TINA4_DEBUG", "true")
+        self._bind_probe_db(tmp_path)
+        assert self._row_count() == 0
+        req = _CallReq(
+            {"name": "database_execute",
+             "arguments": {"sql": "INSERT INTO gate_probe (v) VALUES ('pwned')"}},
+            remote_ip="8.8.8.8")
+        resp = await self._call(req)
+        assert resp.status == 404
+        assert self._row_count() == 0, \
+            "remote unauthenticated /call executed database_execute - the hole is open"
+
+    async def test_remote_with_valid_bearer_runs_the_tool(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TINA4_DEBUG", "true")
+        monkeypatch.setenv("TINA4_MCP_REMOTE", "true")
+        monkeypatch.setenv("TINA4_MCP_TOKEN", "s3cr3t-token")
+        self._bind_probe_db(tmp_path)
+        assert self._row_count() == 0
+        req = _CallReq(
+            {"name": "database_execute",
+             "arguments": {"sql": "INSERT INTO gate_probe (v) VALUES ('ok')"}},
+            remote_ip="8.8.8.8", headers={"authorization": "Bearer s3cr3t-token"})
+        resp = await self._call(req)
+        assert resp.status == 200
+        assert self._row_count() == 1
+
+    async def test_spoofed_forwarded_for_is_ignored(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TINA4_DEBUG", "true")
+        self._bind_probe_db(tmp_path)
+        assert self._row_count() == 0
+        req = _CallReq(
+            {"name": "database_execute",
+             "arguments": {"sql": "INSERT INTO gate_probe (v) VALUES ('xff')"}},
+            remote_ip="8.8.8.8",
+            headers={"x-forwarded-for": "127.0.0.1"})
+        resp = await self._call(req)
+        assert resp.status == 404
+        assert self._row_count() == 0, \
+            "spoofed X-Forwarded-For bypassed the raw-peer gate on /call"

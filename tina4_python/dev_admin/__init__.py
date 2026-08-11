@@ -2984,6 +2984,13 @@ async def _api_mcp_call(request, response):
     through `handle_message` — we already know the name and args, no
     need to round-trip through JSON-RPC framing.
     """
+    # Two-layer gate, identical to every other MCP surface (tools-list, the
+    # JSON-RPC endpoint, the SSE stream): a disallowed caller gets 404 BEFORE
+    # any tool runs. Without this, a remote unauthenticated caller on a
+    # TINA4_DEBUG=true 0.0.0.0-bound server could invoke every tool
+    # (database_execute, file_write). Uses the RAW socket peer, never XFF.
+    if not _mcp_request_allowed(request):
+        return response({"ok": False, "error": "MCP forbidden"}, 404)
     body = request.body or {}
     if not isinstance(body, dict):
         return response({"ok": False, "error": "body must be a JSON object"}, 400)
