@@ -2706,6 +2706,42 @@ def _stage_session_save(ctx: DispatchContext) -> None:
     return None
 
 
+def _stage_no_content_strip(ctx: DispatchContext) -> None:
+    """RFC 9110 s15.3.5: a 204 response MUST NOT carry content.
+
+    Unconditional and late, for the reason ``_stage_head_strip`` below is:
+    whoever put the body there does not get to keep it. A guard inside a single
+    injector only protects that injector, and there is more than one. The dev
+    toolbar appended 8.5KB-class markup to EVERY 204 - it gated on dev mode and
+    ``text/html``, and a 204 IS text/html, because ``Response()`` sets that
+    content type unconditionally and ``response(None, 204)`` (what `tina4 make
+    crud` scaffolds for every delete handler) only empties the body. Measured at
+    3.13.136: a scaffolded DELETE returned 1037 bytes declaring Content-Length
+    1037, and an OPTIONS on a known path returned 1032. The feedback widget in
+    ``app()`` reads that same content type from the far side of ``handle()``,
+    and a handler is free to pass content alongside a 204 itself.
+
+    It is not cosmetic. Under uvicorn's h11 the body is refused outright
+    ("Too much data for declared Content-Length") and the connection is torn
+    down, so the NEXT request over it dies with RemoteDisconnected; the DELETE
+    that caused it still returned a clean 204. Under httptools, and under the
+    built-in dev bridge, the bytes just go out and are thrown away - and past
+    1024 bytes ``build_headers`` compresses, so a no-content response went on
+    the wire Content-Encoding: gzip.
+
+    Position is behaviour twice over. It runs BEFORE ``_stage_dev_inspector_capture``,
+    or the dev dashboard reports the 1037 bytes the toolbar wrote for a response
+    that ships none - the stage list's own comment says body_size is meant to be
+    what went on the wire. And BEFORE ``_stage_head_strip``, so a HEAD on a 204
+    reports Content-Length: 0 and not the length of a body that was never
+    allowed to exist.
+    """
+    if ctx.response.status_code != 204:
+        return None
+    ctx.response.content = b""
+    return None
+
+
 def _stage_head_strip(ctx: DispatchContext) -> None:
     """RFC 9110 s9.3.2: a HEAD response MUST NOT include content.
 
@@ -2747,7 +2783,10 @@ _FALLBACK_STAGES = (
 #: Run over the finished Response on the way out, in order.
 #:
 #: Order is BEHAVIOUR: the inspector runs AFTER the toolbar injection so its
-#: body_size reports what went on the wire, and ``_stage_head_strip`` is LAST
+#: body_size reports what went on the wire, and ``_stage_no_content_strip`` sits
+#: BETWEEN them for exactly that reason - place it later and the dashboard
+#: reports 1037 bytes for a 204 that ships none. It is also before the HEAD
+#: strip, so a HEAD on a 204 reports Content-Length: 0. ``_stage_head_strip`` is LAST
 #: because the toolbar injection would otherwise put 8.5KB of markup back into
 #: an already-stripped HEAD response - the body removed and then restored. A
 #: run without TINA4_DEBUG could not see that. Stripping last also makes
@@ -2756,6 +2795,7 @@ _FALLBACK_STAGES = (
 _RESPONSE_STAGES = (
     _stage_apply_cors,
     _stage_dev_toolbar_inject,
+    _stage_no_content_strip,
     _stage_dev_inspector_capture,
     _stage_request_log,
     _stage_session_save,

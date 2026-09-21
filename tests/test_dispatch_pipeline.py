@@ -59,11 +59,16 @@ def test_the_pipeline_declares_its_stages_in_order():
     assert _names(server._RESPONSE_STAGES) == [
         "_stage_apply_cors",
         "_stage_dev_toolbar_inject",
+        "_stage_no_content_strip",
         "_stage_dev_inspector_capture",
         "_stage_request_log",
         "_stage_session_save",
         "_stage_head_strip",
-    ], "head_strip is LAST or the toolbar puts a body back into a HEAD response"
+    ], (
+        "head_strip is LAST or the toolbar puts a body back into a HEAD response; "
+        "no_content_strip sits between the injection and the inspector, or the "
+        "dashboard reports bytes a 204 never shipped"
+    )
 
 
 def test_it_has_no_unnamed_stage():
